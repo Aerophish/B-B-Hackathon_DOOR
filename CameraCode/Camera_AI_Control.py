@@ -1,33 +1,31 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import onnxruntime as ort
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MODEL_PATH = "yolo26n.pt"
-CAMERA_INDEX = 1
+MODEL_PATH = "yolo26n.onnx"
+CAMERA_INDEX = 0
 
 CONFIDENCE = 0.7
-
+YOLO_SIZE = 640
 
 # ============================================================
 # CONTINUUM ARM PARAMETERS
 # ============================================================
 
 L = 0.25                  # Arm length [m]
-r = 0.021                # Tendon distance from centre [m]
+r = 0.021                 # Tendon distance from centre [m]
 
-# Pulley radius [m]
 PULLEY_R = 0.02
 
-# Tendon pulled per servo degree
-PULL_PER_DEGREE = PULLEY_R * np.pi / 180
+PULL_PER_DEGREE = (
+    PULLEY_R * np.pi / 180
+)
 
-# Maximum servo angle
 MAX_SERVO_ANGLE = 90.0
-
 
 # ============================================================
 # CAMERA
@@ -39,38 +37,12 @@ FOV_DEGREES = 70.0
 # CONTROLLER
 # ============================================================
 
-# Maximum servo movement per frame
 MAX_STEP = 1.0
-
-# Smooth movement toward desired position
 SERVO_SMOOTHING = 0.20
-
 
 # ============================================================
 # TENDON DIRECTIONS
 # ============================================================
-
-# Looking at the arm from the base:
-#
-#
-#              S1       S2
-#               ●       ●
-#                \     /
-#                 \   /
-#                  \ /
-#                   ●
-#                   |
-#                   |
-#                   ●
-#                  S3
-#
-#
-# S1 = upper-left
-# S2 = upper-right
-# S3 = bottom
-#
-#
-# These match the MATLAB model.
 
 tendon_direction = np.array([
     [ 0.5,  1.0],     # S1
@@ -78,14 +50,9 @@ tendon_direction = np.array([
     [ 0.0, -1.0]      # S3
 ], dtype=float)
 
-
 # ============================================================
 # SERVO STATE
 # ============================================================
-
-# 0 degrees = neutral
-#
-# All three tendons equally unpulled.
 
 servo = np.array([
     0.0,
@@ -93,17 +60,168 @@ servo = np.array([
     0.0
 ], dtype=float)
 
+# ============================================================
+# LOAD YOLO ONNX
+# ============================================================
+
+session = ort.InferenceSession(
+    MODEL_PATH,
+    providers=["CPUExecutionProvider"]
+)
+
+input_name = session.get_inputs()[0].name
+
+print("YOLO input:", input_name)
+print("YOLO shape:", session.get_inputs()[0].shape)
 
 # ============================================================
-# LOAD YOLO
+# CAMERA
 # ============================================================
-
-model = YOLO(MODEL_PATH)
 
 cap = cv2.VideoCapture(CAMERA_INDEX)
 
 if not cap.isOpened():
     raise RuntimeError("Could not open camera")
+
+
+# ============================================================
+# YOLO INFERENCE
+# ============================================================
+
+def run_yolo(frame):
+    """
+    Run YOLO ONNX inference.
+
+    Returns:
+        detections
+
+    Each detection is:
+        [x1, y1, x2, y2, confidence, class_id]
+
+    Coordinates are in the 640x640 model image.
+    """
+
+    img = cv2.resize(
+        frame,
+        (YOLO_SIZE, YOLO_SIZE)
+    )
+
+    img = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2RGB
+    )
+
+    img = img.astype(
+        np.float32
+    ) / 255.0
+
+    # HWC -> CHW
+    img = np.transpose(
+        img,
+        (2, 0, 1)
+    )
+
+    # Add batch dimension
+    img = np.expand_dims(
+        img,
+        axis=0
+    )
+
+    outputs = session.run(
+        None,
+        {
+            input_name: img
+        }
+    )
+
+    return outputs[0][0]
+
+
+# ============================================================
+# GET BEST PERSON DETECTION
+# ============================================================
+
+def find_person(
+    detections,
+    image_width,
+    image_height
+):
+    """
+    Find the highest-confidence person detection.
+
+    YOLO COCO class:
+        0 = person
+
+    Returns:
+        target_pixel
+        bounding_box
+        confidence
+
+    or:
+        None, None, 0
+    """
+
+    best_conf = 0.0
+    best_box = None
+
+    for detection in detections:
+
+        x1, y1, x2, y2, confidence, class_id = (
+            detection
+        )
+
+        class_id = int(class_id)
+
+        # Only interested in people
+        if class_id != 0:
+            continue
+
+        if confidence < CONFIDENCE:
+            continue
+
+        if confidence <= best_conf:
+            continue
+
+        best_conf = float(
+            confidence
+        )
+
+        # Convert 640x640 coordinates
+        # back to camera coordinates
+
+        x1 = x1 * image_width / YOLO_SIZE
+        x2 = x2 * image_width / YOLO_SIZE
+
+        y1 = y1 * image_height / YOLO_SIZE
+        y2 = y2 * image_height / YOLO_SIZE
+
+        best_box = (
+            x1,
+            y1,
+            x2,
+            y2
+        )
+
+    if best_box is None:
+
+        return (
+            None,
+            None,
+            0.0
+        )
+
+    x1, y1, x2, y2 = best_box
+
+    target_pixel = np.array([
+        (x1 + x2) / 2.0,
+        (y1 + y2) / 2.0
+    ])
+
+    return (
+        target_pixel,
+        best_box,
+        best_conf
+    )
 
 
 # ============================================================
@@ -119,50 +237,36 @@ def forward_kinematics(
 ):
     """
     Calculate continuum-arm tip position and orientation.
-
-    Returns:
-
-        tip_position
-        tip_direction
-        kappa
-        phi
-        bend_angle
-
-    Coordinate system:
-
-        X = original arm direction
-        Y = left/right
-        Z = up/down
-
-    The tip_direction is the camera optical axis,
-    assuming the camera is mounted along the tangent
-    of the continuum arm.
     """
 
-    # --------------------------------------------------------
-    # Servo angle -> tendon pull
-    # --------------------------------------------------------
+    pull = (
+        servo_angles *
+        pull_per_degree
+    )
 
-    pull = servo_angles * pull_per_degree
+    # Equal shortening of every tendon
+    # does not create bending.
 
-    # Equal shortening of every tendon does not create bending.
+    pull_relative = (
+        pull -
+        np.mean(pull)
+    )
 
-    pull_relative = pull - np.mean(pull)
-
-    # --------------------------------------------------------
     # Bending vector
-    # --------------------------------------------------------
 
-    bend = tendon_direction.T @ pull_relative
+    bend = (
+        tendon_direction.T @
+        pull_relative
+    )
 
     bend_y = bend[0]
     bend_z = bend[1]
 
-    bend_magnitude = np.linalg.norm(bend)
+    bend_magnitude = np.linalg.norm(
+        bend
+    )
 
-    # --------------------------------------------------------
     # Curvature
-    # --------------------------------------------------------
 
     if bend_magnitude < 1e-8:
 
@@ -171,16 +275,17 @@ def forward_kinematics(
 
     else:
 
-        kappa = bend_magnitude / (r * L)
+        kappa = (
+            bend_magnitude /
+            (r * L)
+        )
 
         phi = np.arctan2(
             bend_z,
             bend_y
         )
 
-    # --------------------------------------------------------
     # Tip position and orientation
-    # --------------------------------------------------------
 
     if kappa < 1e-8:
 
@@ -200,31 +305,37 @@ def forward_kinematics(
 
     else:
 
-        bend_angle = kappa * L
+        bend_angle = (
+            kappa * L
+        )
 
         R = 1.0 / kappa
 
-        x = R * np.sin(bend_angle)
-
-        rho = R * (
-            1.0 - np.cos(bend_angle)
+        x = (
+            R *
+            np.sin(bend_angle)
         )
 
-        y = rho * np.cos(phi)
+        rho = (
+            R *
+            (1.0 - np.cos(bend_angle))
+        )
 
-        z = rho * np.sin(phi)
+        y = (
+            rho *
+            np.cos(phi)
+        )
+
+        z = (
+            rho *
+            np.sin(phi)
+        )
 
         tip_position = np.array([
             x,
             y,
             z
         ])
-
-        # ----------------------------------------------------
-        # Tip tangent
-        #
-        # This is the camera optical axis.
-        # ----------------------------------------------------
 
         tip_direction = np.array([
             np.cos(bend_angle),
@@ -260,17 +371,14 @@ def pixel_to_camera_ray(
     fov_degrees
 ):
     """
-    Convert image pixel into a unit ray in the camera frame.
+    Convert image pixel into a unit ray
+    in the camera frame.
 
     Camera coordinates:
 
         X = forward
         Y = right
         Z = up
-
-    Therefore:
-
-        camera ray = [forward, right, up]
     """
 
     px, py = pixel
@@ -278,29 +386,21 @@ def pixel_to_camera_ray(
     cx = image_width / 2.0
     cy = image_height / 2.0
 
-    # --------------------------------------------------------
-    # Focal length
-    # --------------------------------------------------------
-
-    fov = np.deg2rad(fov_degrees)
+    fov = np.deg2rad(
+        fov_degrees
+    )
 
     fx = (
         image_width / 2.0
-    ) / np.tan(fov / 2.0)
+    ) / np.tan(
+        fov / 2.0
+    )
 
     fy = fx
-
-    # --------------------------------------------------------
-    # Normalised image coordinates
-    # --------------------------------------------------------
 
     right = (
         px - cx
     ) / fx
-
-    # Image +Y points down.
-    #
-    # Camera +Z points up.
 
     up = -(
         py - cy
@@ -314,7 +414,9 @@ def pixel_to_camera_ray(
         up
     ])
 
-    ray /= np.linalg.norm(ray)
+    ray /= np.linalg.norm(
+        ray
+    )
 
     return ray
 
@@ -327,38 +429,23 @@ def camera_basis_from_tip_direction(
     tip_direction
 ):
     """
-    Construct the camera orientation in the arm-base frame.
-
-    The camera optical axis is the continuum-arm tip tangent.
-
-    Returns:
-
-        forward
-        right
-        up
-
-    All vectors are expressed in arm-base coordinates.
+    Construct camera orientation in
+    arm-base coordinates.
     """
 
-    forward = tip_direction.copy()
+    forward = (
+        tip_direction.copy()
+    )
 
     forward /= np.linalg.norm(
         forward
     )
-
-    # --------------------------------------------------------
-    # Fixed world-up reference
-    # --------------------------------------------------------
 
     world_up = np.array([
         0.0,
         0.0,
         1.0
     ])
-
-    # --------------------------------------------------------
-    # Camera right
-    # --------------------------------------------------------
 
     right = np.cross(
         world_up,
@@ -368,9 +455,6 @@ def camera_basis_from_tip_direction(
     right_norm = np.linalg.norm(
         right
     )
-
-    # If looking almost vertically,
-    # world_up becomes unsuitable.
 
     if right_norm < 1e-8:
 
@@ -383,10 +467,6 @@ def camera_basis_from_tip_direction(
     else:
 
         right /= right_norm
-
-    # --------------------------------------------------------
-    # Camera up
-    # --------------------------------------------------------
 
     up = np.cross(
         forward,
@@ -413,15 +493,8 @@ def camera_ray_to_base(
     tip_direction
 ):
     """
-    Transform a camera-frame ray into the arm-base frame.
-
-    This is the important orientation step.
-
-    The current camera optical axis is the current
-    continuum-arm tip tangent.
-
-    Therefore the transformation changes every time
-    the arm bends.
+    Transform camera-frame ray into
+    arm-base coordinates.
     """
 
     (
@@ -431,12 +504,6 @@ def camera_ray_to_base(
     ) = camera_basis_from_tip_direction(
         tip_direction
     )
-
-    # Camera ray:
-    #
-    # ray[0] = forward
-    # ray[1] = right
-    # ray[2] = up
 
     ray_base = (
         camera_ray[0] * forward +
@@ -463,36 +530,18 @@ def orientation_inverse_kinematics(
     max_servo_angle
 ):
     """
-    Find servo angles required to point the camera
-    in desired_direction.
-
-    IMPORTANT:
-
-    This is NOT trying to reach a point.
-
-    It only tries to orient the camera optical axis.
-
-    desired_direction is expressed in arm-base coordinates.
-
-    The original straight-arm direction is +X.
+    Find servo angles required to point
+    the camera in desired_direction.
     """
 
     desired_direction = (
         desired_direction /
-        np.linalg.norm(desired_direction)
+        np.linalg.norm(
+            desired_direction
+        )
     )
 
-    # --------------------------------------------------------
     # Desired bend angle
-    # --------------------------------------------------------
-
-    # For our continuum arm:
-    #
-    # tip_direction =
-    #
-    # [ cos(theta),
-    #   sin(theta)*cos(phi),
-    #   sin(theta)*sin(phi) ]
 
     cos_theta = np.clip(
         desired_direction[0],
@@ -504,9 +553,7 @@ def orientation_inverse_kinematics(
         cos_theta
     )
 
-    # --------------------------------------------------------
     # Desired bending direction
-    # --------------------------------------------------------
 
     radial = np.sqrt(
         desired_direction[1]**2 +
@@ -524,19 +571,7 @@ def orientation_inverse_kinematics(
             desired_direction[1]
         )
 
-    # --------------------------------------------------------
-    # Convert bend angle to bending-vector magnitude
-    # --------------------------------------------------------
-
-    # From the forward model:
-    #
-    # kappa = bendMagnitude / (r * L)
-    #
-    # theta = kappa * L
-    #
-    # therefore:
-    #
-    # bendMagnitude = r * theta
+    # Bend magnitude
 
     bend_magnitude = (
         r * theta
@@ -547,9 +582,8 @@ def orientation_inverse_kinematics(
         np.sin(phi)
     ])
 
-    # --------------------------------------------------------
-    # Convert bending vector -> tendon pulls
-    # --------------------------------------------------------
+    # Convert bending vector
+    # into tendon pulls
 
     A = tendon_direction.T
 
@@ -561,30 +595,18 @@ def orientation_inverse_kinematics(
         bend
     )
 
-    # --------------------------------------------------------
-    # Tendons can only pull.
-    #
-    # Add a common amount to every tendon so that
-    # the smallest pull is zero.
-    # --------------------------------------------------------
+    # Tendons can only pull
 
     pull_relative -= np.min(
         pull_relative
     )
 
-    # --------------------------------------------------------
     # Tendon pull -> servo angle
-    # --------------------------------------------------------
 
     desired_servo = (
         pull_relative /
         pull_per_degree
     )
-
-    # --------------------------------------------------------
-    # Check whether requested orientation
-    # is physically achievable.
-    # --------------------------------------------------------
 
     max_required = np.max(
         desired_servo
@@ -594,16 +616,6 @@ def orientation_inverse_kinematics(
         max_required <=
         max_servo_angle
     )
-
-    # --------------------------------------------------------
-    # If required angle exceeds servo limits,
-    # scale the bend down while maintaining
-    # the SAME bending direction.
-    #
-    # This means the camera bends as far toward
-    # the person as physically possible rather
-    # than simply demanding impossible servo angles.
-    # --------------------------------------------------------
 
     if not reachable:
 
@@ -622,22 +634,13 @@ def orientation_inverse_kinematics(
 
         theta_actual = theta
 
-    # --------------------------------------------------------
-    # Clamp
-    # --------------------------------------------------------
-
     desired_servo = np.clip(
         desired_servo,
         0.0,
         max_servo_angle
     )
 
-    # --------------------------------------------------------
-    # Calculate actual camera direction
-    # resulting from the limited bend.
-    #
-    # This is useful for diagnostics.
-    # --------------------------------------------------------
+    # Actual direction
 
     bend_angle = theta_actual
 
@@ -654,11 +657,6 @@ def orientation_inverse_kinematics(
     actual_direction /= np.linalg.norm(
         actual_direction
     )
-
-    # --------------------------------------------------------
-    # Angular error between requested and achievable
-    # directions.
-    # --------------------------------------------------------
 
     dot = np.clip(
         np.dot(
@@ -701,56 +699,23 @@ while True:
         height / 2.0
     ])
 
-
     # ========================================================
     # YOLO
     # ========================================================
 
-    results = model.predict(
-        frame,
-        conf=CONFIDENCE,
-        verbose=False
+    detections = run_yolo(
+        frame
     )
 
-    result = results[0]
-
-    target_pixel = None
-
-
-    # --------------------------------------------------------
-    # Find highest-confidence person
-    # --------------------------------------------------------
-
-    if result.boxes is not None:
-
-        best_conf = 0.0
-
-        for box in result.boxes:
-
-            class_id = int(
-                box.cls[0]
-            )
-
-            confidence = float(
-                box.conf[0]
-            )
-
-            if (
-                class_id == 0 and
-                confidence > best_conf
-            ):
-
-                best_conf = confidence
-
-                x1, y1, x2, y2 = (
-                    box.xyxy[0].tolist()
-                )
-
-                target_pixel = np.array([
-                    (x1 + x2) / 2.0,
-                    (y1 + y2) / 2.0
-                ])
-
+    (
+        target_pixel,
+        target_box,
+        target_confidence
+    ) = find_person(
+        detections,
+        width,
+        height
+    )
 
     # ========================================================
     # CURRENT ARM FORWARD KINEMATICS
@@ -770,20 +735,6 @@ while True:
         tendon_direction
     )
 
-
-    # ========================================================
-    # CAMERA BASIS
-    # ========================================================
-
-    (
-        camera_forward,
-        camera_right,
-        camera_up
-    ) = camera_basis_from_tip_direction(
-        tip_direction
-    )
-
-
     # ========================================================
     # TRACK PERSON
     # ========================================================
@@ -791,22 +742,38 @@ while True:
     if target_pixel is not None:
 
         # ----------------------------------------------------
-        # Draw detected person
+        # Draw bounding box
         # ----------------------------------------------------
 
-        cv2.circle(
+        x1, y1, x2, y2 = target_box
+
+        cv2.rectangle(
             frame,
-            tuple(
-                target_pixel.astype(int)
-            ),
-            10,
+            (int(x1), int(y1)),
+            (int(x2), int(y2)),
             (0, 255, 0),
-            -1
+            2
         )
 
+        # ----------------------------------------------------
+        # Label
+        # ----------------------------------------------------
+
+        cv2.putText(
+            frame,
+            f"PERSON {target_confidence:.2f}",
+            (
+                int(x1),
+                max(int(y1) - 10, 20)
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2
+        )
 
         # ----------------------------------------------------
-        # Convert pixel to camera ray
+        # Camera ray
         # ----------------------------------------------------
 
         camera_ray = pixel_to_camera_ray(
@@ -816,30 +783,19 @@ while True:
             FOV_DEGREES
         )
 
-
         # ----------------------------------------------------
-        # Convert current-camera ray to arm-base direction
-        #
-        # THIS is the important orientation calculation.
-        #
-        # The camera orientation is recalculated from
-        # the current tip direction every frame.
+        # Convert to arm-base direction
         # ----------------------------------------------------
 
-        desired_direction = camera_ray_to_base(
-            camera_ray,
-            tip_direction
+        desired_direction = (
+            camera_ray_to_base(
+                camera_ray,
+                tip_direction
+            )
         )
-
 
         # ----------------------------------------------------
         # Orientation IK
-        #
-        # We are NOT giving it a target distance.
-        #
-        # We are only asking:
-        #
-        # "Which direction should the camera point?"
         # ----------------------------------------------------
 
         (
@@ -861,30 +817,16 @@ while True:
         # SERVO CONTROL
         # ====================================================
 
-        # Difference between desired and current servo positions
-
         servo_error = (
             desired_servo -
             servo
         )
 
-        # ----------------------------------------------------
-        # ONLY MOVE ONE SERVO AT A TIME
-        # ----------------------------------------------------
-        #
-        # Find the servo that needs the largest correction.
-        #
-        # This prevents multiple servos from being commanded
-        # simultaneously while we are testing the mechanism.
-        #
+        # Only move one servo at a time
 
         active_servo = np.argmax(
             np.abs(servo_error)
         )
-
-        # ----------------------------------------------------
-        # Move only the selected servo
-        # ----------------------------------------------------
 
         step = np.clip(
             servo_error[active_servo],
@@ -897,16 +839,11 @@ while True:
             SERVO_SMOOTHING
         )
 
-        # ----------------------------------------------------
-        # Servo limits
-        # ----------------------------------------------------
-
         servo = np.clip(
             servo,
             0.0,
             MAX_SERVO_ANGLE
         )
-
 
         # ====================================================
         # IMAGE-SPACE ERROR
@@ -917,10 +854,8 @@ while True:
             camera_centre
         )
 
-
-        # ----------------------------------------------------
-        # Draw line from image centre to person
-        # ----------------------------------------------------
+        # Line from camera centre
+        # to person
 
         cv2.line(
             frame,
@@ -934,16 +869,19 @@ while True:
             2
         )
 
-
     else:
 
         desired_direction = None
 
         desired_servo = servo.copy()
 
-        desired_bend_angle = current_bend_angle
+        desired_bend_angle = (
+            current_bend_angle
+        )
 
-        achievable_bend_angle = current_bend_angle
+        achievable_bend_angle = (
+            current_bend_angle
+        )
 
         desired_phi = current_phi
 
@@ -951,20 +889,12 @@ while True:
 
         angular_error = 0.0
 
-
     # ========================================================
-    # YOLO ANNOTATION
+    # CAMERA CENTRE
     # ========================================================
-
-    annotated = result.plot()
-
-
-    # --------------------------------------------------------
-    # Camera centre
-    # --------------------------------------------------------
 
     cv2.drawMarker(
-        annotated,
+        frame,
         tuple(
             camera_centre.astype(int)
         ),
@@ -974,15 +904,14 @@ while True:
         2
     )
 
-
-    # --------------------------------------------------------
-    # Person
-    # --------------------------------------------------------
+    # ========================================================
+    # TARGET CENTRE
+    # ========================================================
 
     if target_pixel is not None:
 
         cv2.circle(
-            annotated,
+            frame,
             tuple(
                 target_pixel.astype(int)
             ),
@@ -990,19 +919,6 @@ while True:
             (0, 255, 0),
             -1
         )
-
-        cv2.line(
-            annotated,
-            tuple(
-                camera_centre.astype(int)
-            ),
-            tuple(
-                target_pixel.astype(int)
-            ),
-            (0, 255, 255),
-            2
-        )
-
 
     # ========================================================
     # VIRTUAL SERVO PANEL
@@ -1013,7 +929,6 @@ while True:
         dtype=np.uint8
     )
 
-
     cv2.putText(
         panel,
         "CONTINUUM ARM CONTROLLER",
@@ -1023,7 +938,6 @@ while True:
         (255, 255, 255),
         2
     )
-
 
     # --------------------------------------------------------
     # Servo information
@@ -1071,7 +985,6 @@ while True:
             -1
         )
 
-
     # ========================================================
     # ARM INFORMATION
     # ========================================================
@@ -1106,7 +1019,6 @@ while True:
         1
     )
 
-
     # ========================================================
     # ORIENTATION INFORMATION
     # ========================================================
@@ -1122,7 +1034,6 @@ while True:
         1
     )
 
-
     cv2.putText(
         panel,
         f"Desired bend: "
@@ -1133,7 +1044,6 @@ while True:
         (255, 255, 255),
         1
     )
-
 
     cv2.putText(
         panel,
@@ -1146,9 +1056,8 @@ while True:
         1
     )
 
-
     # --------------------------------------------------------
-    # Reachability status
+    # Reachability
     # --------------------------------------------------------
 
     if target_pixel is None:
@@ -1163,7 +1072,6 @@ while True:
 
         status = "MAX BEND REACHED"
 
-
     cv2.putText(
         panel,
         status,
@@ -1174,21 +1082,19 @@ while True:
         2
     )
 
-
     # ========================================================
     # SHOW
     # ========================================================
 
     cv2.imshow(
         "Endoscope + YOLO",
-        annotated
+        frame
     )
 
     cv2.imshow(
         "Virtual Servos",
         panel
     )
-
 
     # ========================================================
     # QUIT
@@ -1206,4 +1112,4 @@ while True:
 # ============================================================
 
 cap.release()
-cv2.destroyAllWindows()
+cv2.destroyAllWindows() 
