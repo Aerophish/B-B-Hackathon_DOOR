@@ -1,3 +1,4 @@
 gpiozero
 sshkeyboard
 lgpio
+rpi_hardware_pwm
