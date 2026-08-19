@@ -1,6 +1,6 @@
-# B-B Hackathon DOOR
+# DOOR: Disaster Operations & Outreach Rover
 
-B-B Hackathon DOOR is a Raspberry Pi search-and-rescue prototype. Its aim is to locate an opening, position a small platform at the opening, place a camera probe through it, find people with YOLO, and point the probe toward a detected person.
+DOOR is a Raspberry Pi search-and-rescue prototype. Its aim is to locate an opening, position a small platform at the opening, place a camera probe through it, find people with YOLO, and point the probe toward a detected person.
 
 The project currently contains the perception, motion-control, sensor, and CAD building blocks for that workflow.
 
