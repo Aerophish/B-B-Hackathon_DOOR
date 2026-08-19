@@ -1,94 +1,69 @@
 # B-B Hackathon DOOR
 
-Prototype software and CAD for a search-and-rescue concept: identify a suitable opening, drive a small platform to it, send a camera-equipped flexible probe through it, detect people, and aim the probe toward the selected person.
+B-B Hackathon DOOR is a Raspberry Pi search-and-rescue prototype. Its aim is to locate an opening, position a small platform at the opening, place a camera probe through it, find people with YOLO, and point the probe toward a detected person.
 
-The repository contains useful components for that concept, but it is **not yet an end-to-end autonomous system**. The hole detector, mobile-base controls, probe/servo controls, person-tracking demo, and time-of-flight sensor test are separate programs. No code currently connects them into one decision or motion pipeline.
+The project currently contains the perception, motion-control, sensor, and CAD building blocks for that workflow.
 
-## Project Goal
-
-The intended operational flow is:
+## Current Scope
 
 ```text
-Surface camera -> detect a candidate opening -> verify it is safe/large enough
-    -> drive chassis to opening -> insert camera probe
-    -> detect a person with YOLO -> aim probe camera at that person
+Detect opening -> move platform into position -> place probe through opening
+    -> detect a person with the probe camera -> point the probe toward them
 ```
 
-The current repository implements parts of this flow as prototypes:
+The work in this repository is focused on developing each stage of that sequence:
 
-| Capability | Current state | Notes |
-| --- | --- | --- |
-| Detect dark, roughly round openings from a camera | Implemented | Classical OpenCV detector with scoring and temporal confirmation. |
-| Estimate whether an opening fits a 5 cm robot | Partially implemented | Requires a calibrated pixels-per-centimetre value; otherwise the result is intentionally `unknown`. |
-| Return opening positions in camera-centred pixels | Implemented | `hole_detection_main.py` returns confirmed `(x, y)` pixel offsets only, not world coordinates. |
-| Drive the chassis | Manual prototype only | Keyboard teleoperation; no autonomous approach, obstacle avoidance, or link to hole detection. |
-| Read range/lux from a VL6180X sensor | Standalone hardware test | No range data is consumed by navigation, hole verification, or probe insertion. |
-| Drive the physical flexible-probe servos | Manual/calibration prototype only | The YOLO controller does not issue hardware PWM commands. |
-| Detect a person through the probe camera | Implemented as a YOLO/ONNX demo | Assumes a particular ONNX output format and needs validation with the supplied model and camera. |
-| Aim the flexible probe at a detected person | Simulated | Continuum-arm kinematics update an in-memory servo array and display a virtual control panel. |
-| Insert/retract probe | Not implemented | No insertion actuator, depth limit, or collision/safety control is present. |
+| Intended stage | Current implementation |
+| --- | --- |
+| Find a suitable opening | OpenCV hole detection identifies and ranks dark, compact opening candidates from a camera feed. |
+| Check whether the platform can fit | The detector can estimate opening diameter when a camera scale is provided. |
+| Move the platform to the opening | The chassis has keyboard motor control. It is not yet connected to hole detection. |
+| Place the camera probe through the opening | Servo calibration and flexible-arm control components are included; no automated insertion control is present. |
+| Find people through the probe camera | YOLO ONNX inference selects the highest-confidence person in the camera feed. |
+| Point the probe toward a person | Camera geometry and continuum-arm kinematics calculate three servo targets and show them in a virtual control panel. |
+| Measure nearby distance | A VL6180X range and light sensor readout script is included. |
+| Build the probe hardware | STL files for the flexible arm, camera end, and arm bracket are included. |
 
 ## Repository Layout
 
 ```text
 B-B-Hackathon_DOOR/
-|- hole_detection/             Modular OpenCV hole-candidate detector
-|- hole_detection_main.py      One-shot live-camera scan returning coordinates
-|- CameraCode/                 YOLO person tracking and virtual continuum-arm control
-|- MotorControl/               Keyboard control for chassis motors and three servos
-|- ServoCode/                  Single-servo calibration and sweep scripts
-|- ToFCode/                    VL6180X range/lux readout test
-|- CAD/                        STL files for the flexible arm, camera end, and bracket
-`- requirements.txt            Combined Raspberry Pi / vision dependency snapshot
+|- hole_detection/             Hole detection package
+|- hole_detection_main.py      One-shot camera scan returning hole coordinates
+|- CameraCode/                 YOLO person detection and flexible-arm aiming demo
+|- MotorControl/               Keyboard control for chassis motors and servos
+|- ServoCode/                  Servo calibration and sweep scripts
+|- ToFCode/                    VL6180X range and light sensor test
+|- CAD/                        Flexible-arm and camera-mount STL files
+`- requirements.txt            Project dependencies
 ```
-
-## Hardware Assumptions
-
-The code targets a Raspberry Pi-based prototype. Hardware-specific dependencies and pin assignments are not portable to Windows/macOS or a typical desktop Linux machine.
-
-* Camera input uses OpenCV camera indices. Hole detection defaults to index `0`; `CameraCode/Camera_Test.py` uses index `1`; the YOLO controller defaults to `0`.
-* Chassis control uses `gpiozero.Robot` with left motor pins GPIO `14`, `15` and right motor pins GPIO `23`, `24`.
-* Servo helpers use `rpi_hardware_pwm` at 50 Hz and PWM channels `(0, 2, 3)`. `ServoCode/servo_control.py` directly uses PWM channel `3` on chip `0`.
-* `ToFCode/Test.py` expects an Adafruit VL6180X on the default I2C bus (`board.SCL`/`board.SDA`).
-* CAD assets are provided as STL files in `CAD/`; the source CAD design files are not included.
-
-Power servos from an appropriately rated external supply with a common ground to the Pi. Do not assume the Pi can safely power multiple servos directly.
 
 ## Setup
 
-Use a Raspberry Pi environment for hardware programs. Python 3.11 or newer is recommended because the hole-detection package uses modern built-in generic type syntax.
-
-From the repository root:
+The hardware scripts target a Raspberry Pi. Create a Python environment and install the project dependencies from the repository root:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -r MotorControl\requirements.txt
 ```
 
-On Raspberry Pi/Linux, activate the virtual environment with the platform-appropriate command instead. The top-level requirements cover the computer-vision, ONNX, VL6180X, and PWM packages. The `MotorControl` requirements separately add `gpiozero` and `sshkeyboard`.
-
-`rpi_hardware_pwm`, `lgpio`, `RPi.GPIO`, and related packages require compatible Raspberry Pi hardware and OS support. They should not be expected to function on a development PC.
+The camera and vision tools use OpenCV and ONNX Runtime. The motor, servo, and ToF scripts use Raspberry Pi GPIO, PWM, I2C, and Adafruit libraries.
 
 ## Hole Detection
 
-The `hole_detection` package detects visually dark, compact regions that resemble openings. It does not prove that a region is traversable or that it is physically a hole.
+The `hole_detection` package looks for dark, compact regions that resemble openings. It processes each frame by:
 
-### Pipeline
+1. Converting the image to grayscale and improving local contrast.
+2. Creating a mask of dark regions with adaptive thresholding.
+3. Filtering regions by size, shape, solidity, contrast, and boundary edges.
+4. Scoring the remaining candidates.
+5. Tracking candidates across frames and confirming those seen consistently.
 
-For each camera frame, `HoleDetector`:
+A candidate is confirmed after 60 consecutive frames. The detector can also estimate whether an opening is large enough for a 5 cm robot when a pixels-per-centimetre calibration is supplied.
 
-1. Converts the frame to grayscale, denoises it, and applies CLAHE local contrast normalisation.
-2. Uses inverse adaptive thresholding and morphological open/close operations to form a mask of dark regions.
-3. Finds external contours and rejects candidates by area, aspect ratio, solidity, local dark-versus-surrounding contrast, and boundary-edge support.
-4. Scores accepted candidates with contrast, edge strength, area, and temporal stability.
-5. Associates detections across frames by nearest image-centre position. A candidate must appear for 60 consecutive frames before it is confirmed.
-
-Detector tuning lives in [hole_detection/config.py](hole_detection/config.py), including thresholds, score weights, confirmation duration, assumed robot diameter, and optional calibration scale.
-
-### Live preview
+### Live camera preview
 
 Run from the repository root:
 
@@ -96,7 +71,7 @@ Run from the repository root:
 python -m hole_detection.camera
 ```
 
-Useful options:
+Common options:
 
 ```powershell
 python -m hole_detection.camera --camera-index 1
@@ -104,76 +79,63 @@ python -m hole_detection.camera --width 1280 --height 720
 python -m hole_detection.camera --pixels-per-cm 20
 ```
 
-Press `Q` or `Esc` in the preview window to exit. Confirmed detections are drawn only after 60 uninterrupted observations. With no scale supplied, the preview displays `FIT UNKNOWN`; this is deliberate and should not be treated as clearance approval.
+Press `Q` or `Esc` to close the preview. Detector parameters are collected in `hole_detection/config.py`.
 
-### One-shot coordinate scan
+### One-shot camera scan
 
 ```powershell
 python hole_detection_main.py --camera-index 0 --scan-frames 120
 ```
 
-This bounded scan prints one of the following forms:
+The program returns confirmed hole locations as camera-centred pixel coordinates:
 
 ```text
-((x, y),)                    one confirmed candidate
-((x1, y1), (x2, y2), ...)    multiple confirmed candidates
-((-10000.0, -10000.0),)      no confirmed candidate
+((x, y),)                    one confirmed opening
+((x1, y1), (x2, y2), ...)    multiple confirmed openings
+((-10000.0, -10000.0),)      no confirmed opening
 ```
 
-Coordinates are image pixels relative to the frame centre: positive `x` is right and positive `y` is up. They are not distances, robot-frame positions, or chassis commands. The program returns only candidates confirmed during the scan, so the default 120-frame run provides time for its 60-frame confirmation requirement.
+Positive `x` points right and positive `y` points up.
 
-Set `SHOW_CAMERA_PREVIEW = False` in `hole_detection_main.py` only when deliberately running without a display. This is a documented runtime setting, not an autonomous mode switch.
-
-### Process a saved image
+### Saved image
 
 ```powershell
 python -m hole_detection.cli --input path\to\image.jpg --output annotated.jpg
-python -m hole_detection.cli --input path\to\image.jpg --output annotated.jpg --pixels-per-cm 20
 ```
 
-This annotates all candidates found in a single image. Because temporal tracking has only one frame, none of those candidates will be confirmed; use it for tuning the visual filters, not for deployment decisions.
+Use `--pixels-per-cm` to include the size estimate in the result.
 
-### Limits and required validation
+## Person Detection and Probe Aiming
 
-The detector currently has no depth camera, camera calibration, plane/perspective correction, lighting validation, map, or approach-path check. Its physical diameter estimate is the smaller bounding-box side divided by a manually supplied scale, which varies with range and perspective. Its simple image-space tracker is explicitly unsuitable for substantial robot movement. Before using it to select an entry point, validate it on representative material, illumination, standoff distances, and camera motion, then add depth/rim/slope/clearance checks.
+`CameraCode/AI_Control_main.py` runs the probe-camera demonstration. It reads a camera feed, performs inference with the bundled `yolo26n.onnx` model, selects the highest-confidence `person` detection, and converts its image position into a direction for the flexible arm.
 
-## Person Detection and Virtual Probe Aiming
+The arm model uses three tendon-driven servo values. Forward and inverse kinematics calculate the arm direction and desired servo positions, while a virtual panel displays the arm state and target information.
 
-`CameraCode/AI_Control_main.py` is a live demonstration that:
-
-1. Captures frames from `CAMERA_INDEX`.
-2. Runs the bundled `yolo26n.onnx` model through ONNX Runtime.
-3. Chooses the highest-confidence COCO class `0` (`person`) result above `CONFIDENCE = 0.7`.
-4. Converts the detection centre from image pixels to a camera ray using an assumed horizontal FOV of 70 degrees.
-5. Converts that ray to the continuum-arm base frame.
-6. Uses orientation inverse kinematics to calculate three desired tendon-servo angles, then visualises the evolving in-memory servo values and arm state.
-
-Run it from the `CameraCode` directory so its unqualified imports and `MODEL_PATH = "yolo26n.onnx"` resolve correctly:
+Run it from `CameraCode` so the model and local imports are found:
 
 ```powershell
 cd CameraCode
 python AI_Control_main.py
 ```
 
-Press `q` to exit. `Camera_Test.py` is a simpler camera-preview check:
+Press `q` to exit. To check a camera feed without YOLO, run:
 
 ```powershell
 python Camera_Test.py
 ```
 
-### Important limitations
+Important files in this module:
 
-* The controller is a simulation: `controller.py` only updates a NumPy array and the UI panel. It does not import or call either physical `Servo` implementation.
-* It changes orientation only. It does not command probe insertion, retraction, chassis motion, or target range estimation.
-* The camera FOV, arm length, tendon radius, pulley radius, tendon geometry, servo zeroes, and servo-angle-to-tendon-pull conversion are fixed assumptions in `CameraCode/config.py`; they have not been calibrated in code.
-* Frames are resized directly to 640 x 640, which distorts non-square input. The detector assumes the model output is already rows of `[x1, y1, x2, y2, confidence, class_id]` and does not apply non-maximum suppression. Confirm this contract against the supplied ONNX export before trusting detections.
-* There is no target persistence, safety envelope, joint feedback, camera-to-arm extrinsic calibration, or closed-loop confirmation that the probe actually moved toward the person.
+* `yolo_detector.py` loads the ONNX model and selects a person detection.
+* `camera_geometry.py` converts image pixels into camera and arm directions.
+* `kinematics.py` contains flexible-arm forward and inverse kinematics.
+* `controller.py` updates the three servo targets.
+* `visualisation.py` draws the camera target and virtual servo panel.
+* `config.py` holds camera, YOLO, arm, and servo settings.
 
-## Manual Motor and Servo Tests
+## Motor and Servo Controls
 
-These scripts are hardware tests, not components wired into the autonomous workflow.
-
-### Mobile base
+### Chassis control
 
 From `MotorControl`:
 
@@ -181,17 +143,17 @@ From `MotorControl`:
 python motor_control.py
 ```
 
-Hold `W`, `A`, `S`, or `D` to drive forward, left, reverse, or right at 50% speed; releasing a key calls `robot.stop()`. This script has no startup interlock, camera feedback, obstacle sensing, or exception/finally cleanup. Test with wheels safely raised before ground operation.
+Use `W`, `A`, `S`, and `D` to drive the chassis forward, left, backward, and right. The motor configuration uses GPIO `14` and `15` for the left motor, and GPIO `23` and `24` for the right motor.
 
-### Three-servo keyboard test
+### Three-servo control
 
 ```powershell
 python servo_test.py
 ```
 
-The intended keys are `Q/W` for servo 0, `A/S` for servo 1, and `Z/X` for servo 2. The current loop and step-sign setup should be tested carefully on the real mechanism: it may not produce the intuitive direction implied by the keys. It constrains angles to the open interval `(0, 90)`, so exact endpoints are not reached through keyboard commands.
+The keyboard mapping is `Q/W` for servo 0, `A/S` for servo 1, and `Z/X` for servo 2. Servo helpers use 50 Hz hardware PWM channels `0`, `2`, and `3`.
 
-### Servo sweep/calibration
+### Servo calibration
 
 From `ServoCode`:
 
@@ -199,26 +161,27 @@ From `ServoCode`:
 python servo_control.py
 ```
 
-It repeatedly commands 0, 45, and 90 degrees on PWM channel 3. `ServoCode/servo_test.py` instead sweeps one selected channel from 0 to 90 degrees and back. Both are direct hardware programs; stop them with `Ctrl+C` and verify mechanical travel before use.
+This cycles a selected servo through 0, 45, and 90 degrees. `ServoCode/servo_test.py` provides a continuous 0-90 degree sweep.
 
-## Time-of-Flight Sensor Test
+## ToF Sensor
 
-From `ToFCode`:
+`ToFCode/Test.py` reads distance and ambient light from an Adafruit VL6180X sensor connected over I2C.
 
 ```powershell
+cd ToFCode
 python Test.py
 ```
 
-It continuously prints VL6180X range in millimetres and ambient light. It is an Adafruit example adapted as a connectivity test and currently has no integration with robot control or perception.
+The script prints range measurements in millimetres and light readings in lux.
 
 ## CAD Assets
 
-`CAD/` contains printable STL meshes:
+The `CAD` folder contains printable STL files for the mechanical prototype:
 
-* `Flexi Arm Prototype 1.stl` - flexible arm prototype.
-* `Arm Camera End.stl` - camera-end part.
-* `Arm Bracket V2.stl` - arm mounting bracket.
+* `Flexi Arm Prototype 1.stl`
+* `Arm Camera End.stl`
+* `Arm Bracket V2.stl`
 
-Check dimensions, material suitability, cable routing, pinch points, and mechanical stops before attaching powered hardware.
+## Hardware Notes
 
-
+The project uses OpenCV camera indices, Raspberry Pi GPIO motor control, hardware PWM servos, and an I2C ToF sensor. Camera index and arm settings are configured in the relevant module configuration files. Use an external power supply sized for the servos, with a shared ground to the Raspberry Pi.
